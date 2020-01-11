@@ -43,7 +43,7 @@ resource "aws_route_table_association" "a" {
 
 resource "aws_autoscaling_group" "app" {
   name                 = "tf-test-asg"
-  vpc_zone_identifier  = [aws_subnet.main.*.id]
+  vpc_zone_identifier  = flatten(aws_subnet.main.*.id)
   min_size             = var.asg_min
   max_size             = var.asg_max
   desired_capacity     = var.asg_desired
@@ -298,7 +298,7 @@ resource "aws_alb_target_group" "test" {
 
 resource "aws_alb" "main" {
   name            = "tf-example-alb-ecs"
-  subnets         = [aws_subnet.main.*.id]
+  subnets         = flatten(aws_subnet.main.*.id)
   security_groups = [aws_security_group.lb_sg.id]
 }
 
