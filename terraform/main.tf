@@ -83,12 +83,17 @@ data "aws_ami" "stable_coreos" {
   owners = ["595879546273"] # CoreOS
 }
 
+resource "aws_key_pair" "default" {
+  key_name   = "terraform-phoenix"
+  public_key = "ssh-rsa ${var.ssh_public_key}"
+}
+
 resource "aws_launch_configuration" "app" {
   security_groups = [
     aws_security_group.instance_sg.id,
   ]
 
-  key_name                    = var.key_name
+  key_name                    = aws_key_pair.default.key_name
   image_id                    = data.aws_ami.stable_coreos.id
   instance_type               = var.instance_type
   iam_instance_profile        = aws_iam_instance_profile.app.name
@@ -159,39 +164,149 @@ resource "aws_security_group" "instance_sg" {
   }
 }
 
+resource "aws_security_group" "docdb_sg" {
+  description = "controls direct access to the DocumentDB service"
+  vpc_id      = aws_vpc.main.id
+  name        = "tf-db-docdbsg"
+
+  ingress {
+    protocol  = "tcp"
+    from_port = 27017
+    to_port   = 27017
+
+    cidr_blocks = [
+      var.admin_cidr_ingress,
+    ]
+  }
+
+  ingress {
+    protocol  = "tcp"
+    from_port = 27017
+    to_port   = 27017
+
+    security_groups = [
+      aws_security_group.lb_sg.id,
+      aws_security_group.instance_sg.id
+    ]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+## DocumentDB
+
+resource "aws_docdb_cluster" "main" {
+  cluster_identifier      = "tf-phoenix-docdb-cluster"
+  engine                  = "docdb"
+  port                    = 27017
+  master_username         = "phoenix"
+  master_password         = var.docdb_password
+  backup_retention_period = var.docdb_backup_retention
+  preferred_backup_window = "01:00-03:00"
+  storage_encrypted       = true
+  skip_final_snapshot     = true
+  db_subnet_group_name    = aws_docdb_subnet_group.default.name
+  vpc_security_group_ids  = [
+    aws_security_group.docdb_sg.id,
+    # aws_security_group.instance_sg.id
+  ]
+}
+
+resource "aws_docdb_cluster_instance" "default" {
+  count              = var.docdb_cluster_size
+  identifier         = "phoenix-docdb-cluster-${count.index + 1}"
+  cluster_identifier = aws_docdb_cluster.main.id
+  instance_class     = var.docdb_instance_type
+}
+
+resource "aws_docdb_subnet_group" "default" {
+  name        = "tf_phoenix_docdb_subnet"
+  description = "Allowed subnets for DB cluster instances"
+  subnet_ids  = flatten(aws_subnet.main.*.id)
+}
+
+
+## ECR
+
+resource "aws_ecr_repository" "tf_phoenix" {
+  name = "tf-phoenix-ecr-repository"
+}
+
+resource "aws_ecr_lifecycle_policy" "phoenix_policy" {
+  repository = aws_ecr_repository.tf_phoenix.name
+
+  policy = <<EOF
+{
+    "rules": [
+        {
+            "rulePriority": 1,
+            "description": "Expire untagged images older than 14 days",
+            "selection": {
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
+                "countUnit": "days",
+                "countNumber": 14
+            },
+            "action": {
+                "type": "expire"
+            }
+        },
+        {
+            "rulePriority": 2,
+            "description": "Keep last 30 images",
+            "selection": {
+                "tagStatus": "tagged",
+                "tagPrefixList": ["v"],
+                "countType": "imageCountMoreThan",
+                "countNumber": 30
+            },
+            "action": {
+                "type": "expire"
+            }
+        }
+    ]
+}
+EOF
+}
+
 ## ECS
 
 resource "aws_ecs_cluster" "main" {
-  name = "terraform_example_ecs_cluster"
+  name = "terraform_phoenix_ecs_cluster"
 }
 
 data "template_file" "task_definition" {
   template = file("${path.module}/task-definition.json")
 
   vars = {
-    image_url        = "ghost:latest"
-    container_name   = "ghost"
+    image_url        = "tf-phoenix:latest"
+    container_name   = "tf-phoenix"
     log_group_region = var.aws_region
     log_group_name   = aws_cloudwatch_log_group.app.name
   }
 }
 
-resource "aws_ecs_task_definition" "ghost" {
-  family                = "tf_example_ghost_td"
+resource "aws_ecs_task_definition" "tf_phoenix_task_definition" {
+  family                = "tf_phoenix_td"
   container_definitions = data.template_file.task_definition.rendered
 }
 
 resource "aws_ecs_service" "test" {
-  name            = "tf-example-ecs-ghost"
+  name            = "tf-phoenix-ecs-service"
   cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.ghost.arn
+  task_definition = aws_ecs_task_definition.tf_phoenix_task_definition.arn
   desired_count   = var.service_desired
   iam_role        = aws_iam_role.ecs_service.name
 
   load_balancer {
     target_group_arn = aws_alb_target_group.test.id
-    container_name   = "ghost"
-    container_port   = "2368"
+    container_name   = "tf-phoenix"
+    container_port   = "8080"
   }
 
   depends_on = [
@@ -203,7 +318,7 @@ resource "aws_ecs_service" "test" {
 ## IAM
 
 resource "aws_iam_role" "ecs_service" {
-  name = "tf_example_ecs_role"
+  name = "tf_phoenix_ecs_role"
 
   assume_role_policy = <<EOF
 {
@@ -223,7 +338,7 @@ EOF
 }
 
 resource "aws_iam_role_policy" "ecs_service" {
-  name = "tf_example_ecs_policy"
+  name = "tf_phoenix_ecs_policy"
   role = aws_iam_role.ecs_service.name
 
   policy = <<EOF
@@ -253,7 +368,7 @@ resource "aws_iam_instance_profile" "app" {
 }
 
 resource "aws_iam_role" "app_instance" {
-  name = "tf-ecs-example-instance-role"
+  name = "tf-ecs-phoenix-instance-role"
 
   assume_role_policy = <<EOF
 {
@@ -290,14 +405,14 @@ resource "aws_iam_role_policy" "instance" {
 ## ALB
 
 resource "aws_alb_target_group" "test" {
-  name     = "tf-example-ecs-ghost"
+  name     = "tf-phoenix-ecs-tg"
   port     = 8080
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 }
 
 resource "aws_alb" "main" {
-  name            = "tf-example-alb-ecs"
+  name            = "tf-phoenix-alb-ecs"
   subnets         = flatten(aws_subnet.main.*.id)
   security_groups = [aws_security_group.lb_sg.id]
 }
@@ -317,8 +432,10 @@ resource "aws_alb_listener" "front_end" {
 
 resource "aws_cloudwatch_log_group" "ecs" {
   name = "tf-ecs-group/ecs-agent"
+  retention_in_days = 90
 }
 
 resource "aws_cloudwatch_log_group" "app" {
-  name = "tf-ecs-group/app-ghost"
+  name = "tf-ecs-group/app-phoenix"
+  retention_in_days = 30
 }
